@@ -4,9 +4,9 @@ Configuration
 
 import os
 
-from omegaconf import DictConfig, ListConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf
 
-Config = DictConfig# | ListConfig
+Config = DictConfig
 
 
 def _Config(topic: str, config=None, prepend=None, append=None) -> Config:

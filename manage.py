@@ -8,9 +8,12 @@ import os
 from argparse import ArgumentParser, Namespace, RawDescriptionHelpFormatter
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from importlib import import_module
 from itertools import batched
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+from yaml.loader import ParserError
 
 import config
 import yaml
@@ -42,13 +45,120 @@ config:     path to configuration file
 hosts:      path to host inventory file
 hostgroups: path to host groups file
 '''
+KEYWORDS = 'name', 'with', 'do', 'while', 'until', 'if', 'then', 'else'
+try:
+    import_module('ansible')
+    ANSIBLE_PRESENT = True
+except ModuleNotFoundError:
+    ANSIBLE_PRESENT = False
 
 
-def runPlay(host: Host, keyfile: str, plays: list[Path]):
+def ansible(object, vars) -> dict[str, Any]:
+    """
+    Run ansible module
+
+    Args:
+        object (TYPE): Parameters
+    """
+    return dict(status=0, out=f'result of {[n for n in object]}, vars={vars}', err='')
+
+
+def run(object, vars) -> dict[str, Any]:
+    return dict(status=0, out=f'run: {object}', err='ERROR: shit happened')
+
+
+FUNCTION: dict[str, Callable[..., dict[str, Any]]] = {'ansible': ansible, 'run': run}
+
+
+def ifHandled(task: dict[str, Any], keywords: dict[str, Any], vars: dict[str, Any]) -> bool:
+    return False
+
+
+def doUntilHandled(task: dict[str, Any], keywords: dict[str, Any], vars: dict[str, Any]) -> bool:
+    return False
+
+
+def doWhileHandled(task: dict[str, Any], keywords: dict[str, Any], vars: dict[str, Any]) -> bool:
+    return False
+
+
+def commandsHandled(task: dict[str, Any], keywords: dict[str, Any], vars: dict[str, Any]) -> bool:
+    """
+    Handle commands
+
+    Args:
+        task (dict[str, Any]): Description
+        keywords (dict[str, Any]): Description
+        vars (dict[str, Any]): Description
+    """
+    return False
+
+
+def runYamlTaskList(object: list[dict[str, Any]], vars: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    Summary
+    """
+    results: list[dict[str, Any]] = []
+    for taskItem in object:
+        keywords = {}
+        task = taskItem.copy()
+        for keyword in KEYWORDS:
+            if keyword in task:
+                keywords[keyword] = task.pop(keyword)
+        if commandsHandled(task, keywords, vars):
+            continue
+        for name, function in FUNCTION.items():
+            if name in task:
+                results.append(function(task[name], vars))
+                break
+        else:
+            raise RuntimeError(f'Task does not call a known function:\n{yaml.safe_dump(taskItem, sort_keys=False)}')
+    return results
+
+
+def runYaml(object: Any) -> list[dict[str, Any]]:
+    """
+    Run a YAML play list
+
+    Args:
+        object (Any): Play list
+    """
+    assert isinstance(object, list), (
+        "YAML play list must be list (ie list of tasks or list " f"of elements being either dict or list), found {type(object)}"
+    )
+    print(object)
+    vars: dict[str, Any] = {}
+    results: list[dict[str, Any]] = []
+    if all(
+        isinstance(doc, dict) or isinstance(doc, list) and all(isinstance(element, dict) for element in doc) for doc in object
+    ):
+        # List of documents
+        for document in object:
+            if isinstance(document, dict):
+                # Variables
+                vars.update(document)
+            else:
+                results.extend(runYamlTaskList(document, vars))
+        return pp(results)
+    else:
+        raise RuntimeError('Invalid YAML task list format')
+
+
+def runPlayList(host: Host, keyfile: str, plays: list[Path]) -> dict[str, list[dict[str, Any]]]:
+    results: dict[str, list[dict[str, Any]]] = {}
     with ParamikoMachine(host.name, port=host['sshport'] or 22, keyfile=keyfile, missing_host_policy=WarningPolicy) as remote:
         for play in plays:
+            # Attempt to interpret as YAML
+            try:
+                with play.open() as stream:
+                    object = list(yaml.safe_load_all(stream=stream))
+                    results[str(play)] = runYaml(object)
+            except ParserError as e:
+                print(e)
+            continue
             remote.upload(play, '/tmp')
-            return remote[remote.path('/tmp') / play].run()
+            results[str(play)] = remote[remote.path('/tmp') / play].run()
+    return pp(results)
 
 
 @dataclass
@@ -89,11 +199,8 @@ class _Context:
                             host.name, search=True
                         ).canonical_name.to_text().rstrip('.')
                         keyfile = f"{keydir}/{user}@{hostdomain}"
-                    results.append((host, executor.submit(runPlay, host, keyfile, plays)))
-        return [
-            {h.name: dict(zip(['status', 'stdout', 'stderr'], r.result()))}
-            for h, r in zip((r[0] for r in results), as_completed(r[1] for r in results))
-        ]
+                    results.append((host, executor.submit(runPlayList, host, keyfile, plays)))
+        return [{h.name: r.result()} for h, r in zip((r[0] for r in results), as_completed(r[1] for r in results))]
 
 
 def _Main():
@@ -110,7 +217,7 @@ def _Main():
     config.Init(args.config)
     inventory = Inventory(config.Hosts, config.HostGroups)
     context = _Context(args, config.Settings, inventory.hosts(args.name))
-    print(yaml.safe_dump_all([f for f in context.run()]))
+    print(yaml.safe_dump_all([f for f in context.run()], sort_keys=False))
 
 
 if __name__ == '__main__':
