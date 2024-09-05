@@ -5,23 +5,23 @@ Manage
 """
 
 import os
+import re
 from argparse import ArgumentParser, Namespace, RawDescriptionHelpFormatter
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from hashlib import sha256
 from importlib import import_module
 from itertools import batched
 from pathlib import Path
 from typing import Any, Callable
-
-from yaml.loader import ParserError
+from shutil import copy2
 
 import config
+import plumbum.machines
 import yaml
-from dns import resolver
 from inventory import Host, Inventory
-from paramiko import WarningPolicy
-
-# from plumbum import SshMachine
+from paramiko import AutoAddPolicy
+from plumbum import local
 from plumbum.machines.paramiko_machine import ParamikoMachine
 from rich import print, traceback
 
@@ -45,12 +45,22 @@ config:     path to configuration file
 hosts:      path to host inventory file
 hostgroups: path to host groups file
 '''
-KEYWORDS = 'name', 'with', 'do', 'while', 'until', 'if', 'then', 'else'
+REMOTE_ROOT = '/var/tmp/manage'
+
 try:
     import_module('ansible')
     ANSIBLE_PRESENT = True
 except ModuleNotFoundError:
     ANSIBLE_PRESENT = False
+
+
+def CamelCase(text: str) -> str:
+    return ''.join(e.title() for e in re.split(r'\W+', text))
+
+
+def Fqdn(host: Host) -> str:
+    hostdomain = host.get('hostdomain')
+    return f"{host.name}{'.' + hostdomain if hostdomain else ''}"
 
 
 def ansible(object, vars) -> dict[str, Any]:
@@ -144,21 +154,122 @@ def runYaml(object: Any) -> list[dict[str, Any]]:
         raise RuntimeError('Invalid YAML task list format')
 
 
-def runPlayList(host: Host, keyfile: str, plays: list[Path]) -> dict[str, list[dict[str, Any]]]:
+class LocalMachine(plumbum.machines.LocalMachine):
+    """
+    LocalMachine with dummy context manager
+    """
+
+    def __init__(self, *unused, **kwargs):
+        """
+        Summary
+
+        Args:
+            *unused: Description
+        """
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *ex):
+        return
+
+    def copy(self, source: str | Path, remotePath: str):
+        """
+        Copy files
+
+        Args:
+            source (str | Path): Description
+        """
+        local.cmd.rsync['--archive', '--delete', '--mkpath', source, remotePath]()
+
+
+class RemoteMachine(ParamikoMachine):
+    """
+    Summary
+    """
+
+    def __init__(
+        self,
+        host,
+        user=None,
+        port=None,
+        password=None,
+        keyfile=None,
+        load_system_host_keys=True,
+        missing_host_policy=None,
+        encoding="utf8",
+        look_for_keys=None,
+        connect_timeout=None,
+        keep_alive=0,
+        gss_auth=False,
+        gss_kex=None,
+        gss_deleg_creds=None,
+        gss_host=None,
+        get_pty=False,
+        load_system_ssh_config=False,
+    ):
+        super().__init__(
+            host,
+            user,
+            port,
+            password,
+            keyfile,
+            load_system_host_keys,
+            missing_host_policy,
+            encoding,
+            look_for_keys,
+            connect_timeout,
+            keep_alive,
+            gss_auth,
+            gss_kex,
+            gss_deleg_creds,
+            gss_host,
+            get_pty,
+            load_system_ssh_config,
+        )
+        self._keyfile = keyfile
+
+    def copy(self, source: str | Path, remotePath: str):
+        """
+        Copy files
+
+        Args:
+            source (str | Path): Description
+        """
+        local.cmd.rsync[
+            '--archive',
+            '--delete',
+            '--compress',
+            '--compress-choice=lz4',
+            '--mkpath',
+            f"--rsh=ssh{f' -i{self._keyfile}' if self._keyfile else ''}",
+            source,
+            f"{self.host}:{remotePath}",
+        ]()
+
+
+CONNECTORS: dict[Any, type[RemoteMachine] | type[LocalMachine]] = {
+    None: RemoteMachine,
+    '': RemoteMachine,
+    'local': LocalMachine,
+}
+
+
+def RunPlayList(host: Host, keyfile: str, plays: list[str]) -> dict[str, list[dict[str, Any]]]:
     results: dict[str, list[dict[str, Any]]] = {}
-    with ParamikoMachine(host.name, port=host['sshport'] or 22, keyfile=keyfile, missing_host_policy=WarningPolicy) as remote:
+    with CONNECTORS[host.get('connection')](Fqdn(host), port=host['sshport'], keyfile=keyfile) as remote:
         for play in plays:
-            # Attempt to interpret as YAML
-            try:
-                with play.open() as stream:
-                    object = list(yaml.safe_load_all(stream=stream))
-                    results[str(play)] = runYaml(object)
-            except ParserError as e:
-                print(e)
-            continue
-            remote.upload(play, '/tmp')
-            results[str(play)] = remote[remote.path('/tmp') / play].run()
-    return pp(results)
+            play, _, script = play.partition(':')
+            playPath = Path(play)
+            remotePlay = sha256(f"{playPath.absolute()}-{playPath.stat().st_ino}".encode()).hexdigest()
+            remotePath = remote.path(REMOTE_ROOT) / remotePlay
+            remote.copy(play, str(remotePath))
+            remotePath = remotePath / playPath.name
+            remoteScript = remotePath
+            if script:
+                remoteScript = remoteScript / script
+            results[str(play)] = [dict(zip(('status', 'out', 'err'), remote[remoteScript].run()))]
+    return results
 
 
 @dataclass
@@ -178,15 +289,7 @@ class _Context:
         Args:
             hosts (set[Host]): hosts to target
         """
-        print(f"Running {self._hosts}")
-        plays: list[Path] = []
         results: list[tuple[Host, Future]] = []
-        for play in self._args.play:
-            playPath = Path(play)
-            if playPath.is_dir():
-                plays.extend(sorted(playPath.iterdir()))
-            elif playPath.exists():
-                plays.append(Path(play))
         with ThreadPoolExecutor(max_workers=self._config.get('threads')) as executor:
             for hosts in batched(self._hosts, self._config.batchsize):
                 for host in hosts:
@@ -194,12 +297,9 @@ class _Context:
                     if not keyfile:
                         localuser = os.environ["USER"]
                         keydir = self._config.get('keydir') or f'/home/{localuser}/.ssh'
-                        user = host.vars.get('user') or localuser
-                        hostdomain = host.vars.get('hostdomain') or resolver.resolve(
-                            host.name, search=True
-                        ).canonical_name.to_text().rstrip('.')
-                        keyfile = f"{keydir}/{user}@{hostdomain}"
-                    results.append((host, executor.submit(runPlayList, host, keyfile, plays)))
+                        user = host.get('user') or localuser
+                        keyfile = f"{keydir}/{user}@{Fqdn(host)}"
+                    results.append((host, executor.submit(RunPlayList, host, keyfile, self._args.play)))
         return [{h.name: r.result()} for h, r in zip((r[0] for r in results), as_completed(r[1] for r in results))]
 
 
@@ -217,6 +317,7 @@ def _Main():
     config.Init(args.config)
     inventory = Inventory(config.Hosts, config.HostGroups)
     context = _Context(args, config.Settings, inventory.hosts(args.name))
+    # print([(g, g.vars) for g in inventory.groups])
     print(yaml.safe_dump_all([f for f in context.run()], sort_keys=False))
 
 

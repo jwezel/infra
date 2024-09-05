@@ -37,11 +37,17 @@ class Node:
     def __getitem__(self, name) -> Any:
         try:
             result = next(
-                node.vars.get(name) for node in sorted(self._upSearch(), key=attrgetter('height')) if node.vars.get(name)
+                node.vars.get(name) for node in sorted(self._upSearch(), key=attrgetter('height')) if name in node.vars
             )
         except StopIteration as e:
             raise InventoryError(f'{self.name} does not have access to a variable {name}') from e
         return result
+
+    def get(self, name, default=None) -> Any:
+        try:
+            return self.__getitem__(name)
+        except InventoryError:
+            return default
 
 
 @dataclass
@@ -64,15 +70,15 @@ class Host(Node):
 
 @dataclass
 class Group(Node):
-    groups: set['Group'] = field(default_factory=set)
-    hosts: set[Host] = field(default_factory=set)
+    groups: set['Group'] = field(default_factory=set, compare=False, repr=False)
+    hosts: set[Host] = field(default_factory=set, compare=False)
     _height: int = -1
 
     def __hash__(self):
         return super().__hash__()
 
     def groupList(self) -> set['Group']:
-        return {self}.union(*(s.groupList() for s in self.groups))
+        return {self}.union(*(s.groupList() for s in self.groups if s is not self))
 
     def hostList(self) -> set[Host]:
         return self.hosts.union(*(g.hosts for g in self.groupList()))
@@ -161,4 +167,4 @@ class Inventory:
 
     @property
     def groups(self):
-        return self._groups
+        return self._groups.values()
