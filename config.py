@@ -36,11 +36,16 @@ def _Config(topic: str, config=None, prepend=None, append=None) -> Config:
         None,
     )
     if path:
-        return OmegaConf.load(path)
+        result = OmegaConf.load(path)
+        assert isinstance(result, DictConfig), f"Config in file {path} must be a mapping, got list"
+        return result
     else:
         return OmegaConf.create()
 
+
 Settings = OmegaConf.create(dict(batchsize=5))
+
+
 def Init(args: list[str]):
     global _CliConfig, Settings, Hosts, HostGroups
     _CliConfig = OmegaConf.from_cli(args)
@@ -48,5 +53,6 @@ def Init(args: list[str]):
     Settings.merge_with(_CliConfig)
     Hosts = _Config('hosts', config=Settings)
     HostGroups = _Config('hostgroups', config=Settings)
+
 
 _CliConfig = Hosts = HostGroups = OmegaConf.create()

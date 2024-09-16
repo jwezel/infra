@@ -4,40 +4,57 @@
 Manage
 """
 
+import json
 import os
+import platform
 import re
+import shlex
 from argparse import ArgumentParser, Namespace, RawDescriptionHelpFormatter
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from hashlib import sha256
-from importlib import import_module
+from io import StringIO
 from itertools import batched
 from pathlib import Path
-from typing import Any, Callable
-from shutil import copy2
+from shutil import get_terminal_size
+from tempfile import NamedTemporaryFile
+from typing import Any, Generator, Sequence
 
 import config
-import plumbum.machines
+import fabric
+import invoke
 import yaml
+from dns.resolver import resolve
+from fabric.connection import Connection
 from inventory import Host, Inventory
+from invoke.context import Context
+from invoke.runners import Result
+from omegaconf import OmegaConf
 from paramiko import AutoAddPolicy
-from plumbum import local
-from plumbum.machines.paramiko_machine import ParamikoMachine
 from rich import print, traceback
+from rich.table import Table
 
-traceback.install(show_locals=True)
+COLUMNS, LINES = get_terminal_size((128, 40))
+
+traceback.install(show_locals=True, word_wrap=True, width=COLUMNS, code_width=COLUMNS)
 
 yaml.representer.SafeRepresenter.add_representer(
     str,
     lambda dumper, data: dumper.represent_scalar(
-        'tag:yaml.org,2002:str', data, style=[None, '|'][any(c in data for c in '\n\r\x0c\x1d\x1e\x85\u2028\u2029')]
+        'tag:yaml.org,2002:str',
+        data,
+        style=[None, '|'][len(data) > 80 or any(c in data for c in '\n\r\x0c\x1d\x1e\x85\u2028\u2029')],
     ),
 )
 
 DESCRIPTION = '''Run state scripts'''
 NAME_HELP = '''host name or group name (* prefix forces interpretation as host name, @ prefix as group name)'''
-PLAY_HELP = '''paths of plays to run'''
-CONFIG_HELP = '''configuration settings in the form of NAME=VALUE. Must be last or separated by -- from NAME arguments.'''
+PLAY_HELP = '''paths of plays to run. Should be after NAME arguments or separated by -- from them.'''
+CONFIG_HELP = (
+    '''configuration settings in the form of CONFIGNAME=VALUE. Should be after NAME arguments or separated by -- from them.'''
+)
+CHECK_HELP = '''enable check mode (dry run without effect)'''
+DIFF_HELP = '''show difference'''
 EPILOG = '''
 Configuration settings available with -s / --set:
 
@@ -46,16 +63,41 @@ hosts:      path to host inventory file
 hostgroups: path to host groups file
 '''
 REMOTE_ROOT = '/var/tmp/manage'
+TERSE_SEPARATORS = ',', ':'
+_MANAGE_PREFIX = '/var/lib/manage'
+REMOTE_CONFIG = fabric.Config()
+REMOTE_CONFIG.runners.remote.input_sleep = 0
+LOCAL_CONFIG = invoke.Config()
+LOCAL_CONFIG.runners.local.input_sleep = 0
 
-try:
-    import_module('ansible')
-    ANSIBLE_PRESENT = True
-except ModuleNotFoundError:
-    ANSIBLE_PRESENT = False
+GET_CONTENTS = '''[ -e "{0}" ] && cat "{0}" || true'''
+PUT_CONTENTS = '''cat > {0}'''
 
 
 def CamelCase(text: str) -> str:
+    """
+    Convert value to camel case name
+
+    Args:
+        text (str): Text
+
+    Returns:
+        str: Camel case text
+    """
     return ''.join(e.title() for e in re.split(r'\W+', text))
+
+
+def YamlBool(mode: bool) -> str:
+    """
+    Convert bool to 'yes'/'no'
+
+    Args:
+        mode (bool): Value
+
+    Returns:
+        str: 'yes' or 'no'
+    """
+    return ['no', 'yes'][mode]
 
 
 def Fqdn(host: Host) -> str:
@@ -63,213 +105,181 @@ def Fqdn(host: Host) -> str:
     return f"{host.name}{'.' + hostdomain if hostdomain else ''}"
 
 
-def ansible(object, vars) -> dict[str, Any]:
+def ExecResult(result: Result | None, command: str | None = None) -> Result:
     """
-    Run ansible module
+    Catch None runner result
 
     Args:
-        object (TYPE): Parameters
+        result (Result | None): Runner result
+        command (str | None, optional): Description
+
+    Returns:
+        Result: Runner result
+
+    Raises:
+        RuntimeError: If result is None
     """
-    return dict(status=0, out=f'result of {[n for n in object]}, vars={vars}', err='')
+    if result is None:
+        raise RuntimeError('No result from execution' + f' {command}' if command else '')
+    return result
 
 
-def run(object, vars) -> dict[str, Any]:
-    return dict(status=0, out=f'run: {object}', err='ERROR: shit happened')
+def JsonEncoded(value: Any) -> Any:
+    if isinstance(value, OmegaConf):
+        return OmegaConf.to_container(value)
+        raise TypeError(value)
 
 
-FUNCTION: dict[str, Callable[..., dict[str, Any]]] = {'ansible': ansible, 'run': run}
-
-
-def ifHandled(task: dict[str, Any], keywords: dict[str, Any], vars: dict[str, Any]) -> bool:
-    return False
-
-
-def doUntilHandled(task: dict[str, Any], keywords: dict[str, Any], vars: dict[str, Any]) -> bool:
-    return False
-
-
-def doWhileHandled(task: dict[str, Any], keywords: dict[str, Any], vars: dict[str, Any]) -> bool:
-    return False
-
-
-def commandsHandled(task: dict[str, Any], keywords: dict[str, Any], vars: dict[str, Any]) -> bool:
+class LocalMachine(Context):
     """
-    Handle commands
-
-    Args:
-        task (dict[str, Any]): Description
-        keywords (dict[str, Any]): Description
-        vars (dict[str, Any]): Description
-    """
-    return False
-
-
-def runYamlTaskList(object: list[dict[str, Any]], vars: dict[str, Any]) -> list[dict[str, Any]]:
-    """
-    Summary
-    """
-    results: list[dict[str, Any]] = []
-    for taskItem in object:
-        keywords = {}
-        task = taskItem.copy()
-        for keyword in KEYWORDS:
-            if keyword in task:
-                keywords[keyword] = task.pop(keyword)
-        if commandsHandled(task, keywords, vars):
-            continue
-        for name, function in FUNCTION.items():
-            if name in task:
-                results.append(function(task[name], vars))
-                break
-        else:
-            raise RuntimeError(f'Task does not call a known function:\n{yaml.safe_dump(taskItem, sort_keys=False)}')
-    return results
-
-
-def runYaml(object: Any) -> list[dict[str, Any]]:
-    """
-    Run a YAML play list
-
-    Args:
-        object (Any): Play list
-    """
-    assert isinstance(object, list), (
-        "YAML play list must be list (ie list of tasks or list " f"of elements being either dict or list), found {type(object)}"
-    )
-    print(object)
-    vars: dict[str, Any] = {}
-    results: list[dict[str, Any]] = []
-    if all(
-        isinstance(doc, dict) or isinstance(doc, list) and all(isinstance(element, dict) for element in doc) for doc in object
-    ):
-        # List of documents
-        for document in object:
-            if isinstance(document, dict):
-                # Variables
-                vars.update(document)
-            else:
-                results.extend(runYamlTaskList(document, vars))
-        return pp(results)
-    else:
-        raise RuntimeError('Invalid YAML task list format')
-
-
-class LocalMachine(plumbum.machines.LocalMachine):
-    """
-    LocalMachine with dummy context manager
+    LocalMachine with dummy context manager and copy method
     """
 
-    def __init__(self, *unused, **kwargs):
+    def __init__(self, host: str | None = None, user: str | None = None, *args, **kwargs):
         """
         Summary
 
         Args:
             *unused: Description
         """
+        super().__init__()
+        self._user = user or os.environ.get('USER', os.environ.get('LOGNAME', 'root'))
+
+    def upload(self, source: str | Path | list[str] | list[Path], remotePath: str | Path):
+        """
+        Copy files
+
+        Args:
+            source (str | Path): Source path
+            remotePath (str): Destination path (not really remote)
+        """
+        command = 'rsync --recursive --perms --delete --mkpath {0} {1}'.format(
+            ' '.join(str(s) for s in source) if isinstance(source, Sequence) else str(source), str(remotePath)
+        )
+        ExecResult(
+            self.sudo(
+                command,
+                user=self._user,
+            ),
+            command,
+        )
+
+    def run(self, command, **kwargs) -> Result:
+        """
+        Do sudo with user given at construction
+
+        Args:
+            *args: invoke.runners.Runner.run args
+            **kwargs: invoke.runners.Runner.run kwargs
+        """
+        return ExecResult(super().sudo(f"bash -c {shlex.quote(command)}", user=self._user, **kwargs), command)
 
     def __enter__(self):
         return self
 
-    def __exit__(self, *ex):
-        return
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pass
 
-    def copy(self, source: str | Path, remotePath: str):
+
+class RemoteMachine(Connection):
+    """
+    A ParamikoMachine with embedded copy method
+    """
+
+    def __init__(self, host: str | None = None, user: str | None = None, *args, **kwargs):
+        super().__init__(host, user, *args, **kwargs)
+        self._user = user
+
+    def upload(self, sources: str | Path | list[str] | list[Path], remotePath: str | Path):
         """
         Copy files
 
         Args:
-            source (str | Path): Description
+            source (str | Path): Source path (local)
+            remotePath (str): Destination path on remote side
         """
-        local.cmd.rsync['--archive', '--delete', '--mkpath', source, remotePath]()
+        with NamedTemporaryFile() as tmpfile:
+            self.local(
+                f'tar --create --xz --file={tmpfile.name} '
+                f'{' '.join(str(s) for s in (sources if isinstance(sources, Sequence) else [sources]))}'
+            )
+            rtmpfile = self.run('mktemp', hide=True).stdout.rstrip('\n')
+            self.put(tmpfile.name, rtmpfile)
+            self.run('mkdir --parents {0};' 'tar --directory {0} --extract --xz --file={1}'.format(str(remotePath), rtmpfile))
 
 
-class RemoteMachine(ParamikoMachine):
-    """
-    Summary
-    """
-
-    def __init__(
-        self,
-        host,
-        user=None,
-        port=None,
-        password=None,
-        keyfile=None,
-        load_system_host_keys=True,
-        missing_host_policy=None,
-        encoding="utf8",
-        look_for_keys=None,
-        connect_timeout=None,
-        keep_alive=0,
-        gss_auth=False,
-        gss_kex=None,
-        gss_deleg_creds=None,
-        gss_host=None,
-        get_pty=False,
-        load_system_ssh_config=False,
-    ):
-        super().__init__(
-            host,
-            user,
-            port,
-            password,
-            keyfile,
-            load_system_host_keys,
-            missing_host_policy,
-            encoding,
-            look_for_keys,
-            connect_timeout,
-            keep_alive,
-            gss_auth,
-            gss_kex,
-            gss_deleg_creds,
-            gss_host,
-            get_pty,
-            load_system_ssh_config,
-        )
-        self._keyfile = keyfile
-
-    def copy(self, source: str | Path, remotePath: str):
-        """
-        Copy files
-
-        Args:
-            source (str | Path): Description
-        """
-        local.cmd.rsync[
-            '--archive',
-            '--delete',
-            '--compress',
-            '--compress-choice=lz4',
-            '--mkpath',
-            f"--rsh=ssh{f' -i{self._keyfile}' if self._keyfile else ''}",
-            source,
-            f"{self.host}:{remotePath}",
-        ]()
-
-
-CONNECTORS: dict[Any, type[RemoteMachine] | type[LocalMachine]] = {
-    None: RemoteMachine,
-    '': RemoteMachine,
-    'local': LocalMachine,
+CONNECTION: dict[Any, tuple[type[RemoteMachine], fabric.Config] | tuple[type[LocalMachine], invoke.Config]] = {
+    None: (RemoteMachine, REMOTE_CONFIG),  # Serves as the default
+    'remote': (RemoteMachine, REMOTE_CONFIG),
+    'local': (LocalMachine, LOCAL_CONFIG),
 }
 
 
-def RunPlayList(host: Host, keyfile: str, plays: list[str]) -> dict[str, list[dict[str, Any]]]:
-    results: dict[str, list[dict[str, Any]]] = {}
-    with CONNECTORS[host.get('connection')](Fqdn(host), port=host['sshport'], keyfile=keyfile) as remote:
-        for play in plays:
-            play, _, script = play.partition(':')
+class Play:
+    """
+    Collection of artifacts of which some can be scripts to run
+    """
+
+    _designation: str
+    _artifacts: dict[Path, str]
+    _scripts: list[Path]
+
+    def __init__(self, play: str) -> None:
+        """
+        Initialize a Play object
+
+        Args:
+            play (str): Play
+        """
+        self._designation = play
+        directory, _, script = play.partition(':')
+        if script:
+            dirPath = Path(directory)
+            self._artifacts = {dirPath: self._checkSum(dirPath)}
+            self._scripts = [dirPath / script]
+        elif (dirPath := Path(play)).is_dir():
+            self._artifacts = {dirPath: self._checkSum(dirPath)}
+            self._scripts = sorted(dirPath / p for p in dirPath.iterdir() if p.is_file())
+        else:
             playPath = Path(play)
-            remotePlay = sha256(f"{playPath.absolute()}-{playPath.stat().st_ino}".encode()).hexdigest()
-            remotePath = remote.path(REMOTE_ROOT) / remotePlay
-            remote.copy(play, str(remotePath))
-            remotePath = remotePath / playPath.name
-            remoteScript = remotePath
-            if script:
-                remoteScript = remoteScript / script
-            results[str(play)] = [dict(zip(('status', 'out', 'err'), remote[remoteScript].run()))]
-    return results
+            self._artifacts = {playPath: self._checkSum(playPath)}
+            self._scripts = [playPath]
+
+    @classmethod
+    def _checkSum(cls, artifact: Path) -> str:
+        """
+        Checksum over the contents of an artifact
+
+        For directory trees, only directory status is considered for efficiency reasons.
+
+        Args:
+            artifact (Path): Artifact path
+
+        Returns:
+            str: Check sum
+        """
+        sum = sha256()
+        if artifact.is_dir():
+            for dir_, dirs, files in artifact.walk():
+                dirs.sort()
+                files.sort()
+                for d in dirs + files:
+                    sum.update((d + str((Path(dir_) / d).stat())).encode('utf-8'))
+        else:
+            sum.update((str(artifact) + str(artifact.stat())).encode('utf-8'))
+        return sum.hexdigest()
+
+    @property
+    def artifacts(self):
+        return self._artifacts
+
+    @property
+    def scripts(self):
+        return self._scripts
+
+    @property
+    def designation(self):
+        return self._designation
 
 
 @dataclass
@@ -281,29 +291,91 @@ class _Context:
     _args: Namespace
     _config: config.Config
     _hosts: set[Host]
+    _hostgroups: config.Config
+    _hostlist: set[Host]
+    _localhost: str = resolve(platform.node(), search=True).canonical_name.to_text().rstrip('.')
 
-    def run(self) -> list[dict[str, dict[str, Any]]]:
+    def run(self) -> Generator[dict[str, list[dict[str, Any]]], None, None]:
         """
         Run plays
 
         Args:
             hosts (set[Host]): hosts to target
         """
-        results: list[tuple[Host, Future]] = []
+        futures: list[Future] = []
         with ThreadPoolExecutor(max_workers=self._config.get('threads')) as executor:
-            for hosts in batched(self._hosts, self._config.batchsize):
+            # Create status for local artifacts
+            plays = [Play(p) for p in self._args.play]
+            # Run plays
+            for hosts in batched(self._hostlist, self._config.batchsize):
                 for host in hosts:
-                    keyfile = host.vars.get('keyfile')
+                    keyfile = host.get('keyfile')
                     if not keyfile:
                         localuser = os.environ["USER"]
                         keydir = self._config.get('keydir') or f'/home/{localuser}/.ssh'
-                        user = host.get('user') or localuser
+                        user = host.get('sshuser') or localuser
                         keyfile = f"{keydir}/{user}@{Fqdn(host)}"
-                    results.append((host, executor.submit(RunPlayList, host, keyfile, self._args.play)))
-        return [{h.name: r.result()} for h, r in zip((r[0] for r in results), as_completed(r[1] for r in results))]
+                    futures.append(executor.submit(self._runPlayList, host, plays, keyfile))
+        return (future.result() for future in as_completed(futures))
+
+    def _runPlayList(self, host: Host, plays: list[Play], keyfile: str) -> dict[str, list[dict[str, Any]]]:
+        results: dict[str, list[dict[str, Any]]] = {}
+        connection, config = CONNECTION[host.get('connection')]
+        with connection(
+            Fqdn(host),
+            user=host.get('sshuser', os.environ.get('USER', os.environ.get('LOGNAME', 'root'))),
+            port=host['sshport'],
+            connect_kwargs=dict(key_filename=keyfile),
+            config=config,
+        ) as remote:
+            for play in plays:
+                remotePath = f'{REMOTE_ROOT}/{self._localhost}'
+                for artifact, checkSum in play.artifacts.items():
+                    remoteArtifactStatPath = f'{remotePath}/artifactstat/{artifact.name}'
+                    if remote.run(GET_CONTENTS.format(remoteArtifactStatPath), hide=True).stdout != checkSum:
+                        remote.run(f'mkdir --parents {remotePath}/artifactstat')
+                        remote.run(PUT_CONTENTS.format(remoteArtifactStatPath), in_stream=StringIO(checkSum))
+                        print(f'Uploading {artifact} to {host.name}:{str(remotePath)}')
+                        remote.upload(artifact, f'{str(remotePath)}/artifacts')
+                for script in play.scripts:
+                    remoteScript = f'{remotePath}/artifacts/{script}'
+                    print(f'Running {play.designation} on {host.name}')
+                    xe = remote.run(
+                        f'{remoteScript}',
+                        in_stream=StringIO(
+                            json.dumps(
+                                dict(
+                                    vars=OmegaConf.to_container(host.vars),
+                                    config=OmegaConf.to_container(self._config),
+                                    hosts={h.name: pp(h.asDict()) for h in self._hosts},
+                                    hostgroups=OmegaConf.to_container(self._hostgroups),
+                                    hostlist=sorted(h.name for h in self._hostlist),
+                                    host=host.name,
+                                ),
+                                separators=TERSE_SEPARATORS,
+                                default=JsonEncoded,
+                            )
+                        ),
+                        env=dict(
+                            PYTHONPYCACHEPREFIX=f'{remotePath}/.pycache',
+                            _MANAGE_PREFIX=_MANAGE_PREFIX,
+                            _MANAGE_OUTPUT_PATH=f'{remotePath}/output',
+                            _MANAGE_CHECK_MODE=YamlBool(self._args.check),
+                            _MANAGE_DIFF_MODE=YamlBool(self._args.difference),
+                        ),
+                        hide='stdout',
+                    )
+                    results[play.designation] = [
+                        (
+                            dict(status=xe.return_code, out=xe.stdout, err=xe.stderr)
+                            if xe
+                            else dict(status=1, out='', err='No status returned')
+                        )
+                    ]
+        return results
 
 
-def _Main():
+def _Main() -> None:
     """
     Main
     """
@@ -313,12 +385,63 @@ def _Main():
     argp.add_argument('name', nargs='*', default=['ALL'], metavar='NAME', help=NAME_HELP)
     argp.add_argument('-p', '--play', nargs='*', metavar='PLAY', help=PLAY_HELP)
     argp.add_argument('-s', '--set', dest='config', nargs='*', help=CONFIG_HELP)
+    argp.add_argument('-c', '--check', action='store_true', help=CHECK_HELP)
+    argp.add_argument('-d', '--difference', action='store_true', help=DIFF_HELP)
     args = argp.parse_args()
     config.Init(args.config)
     inventory = Inventory(config.Hosts, config.HostGroups)
-    context = _Context(args, config.Settings, inventory.hosts(args.name))
+    # config.HostGroups.ALL.vars.config = config.Settings
+    # config.HostGroups.ALL.vars.hostlist = sorted(h.name for h in inventory.hosts(args.name))
+    # config.HostGroups.ALL.vars.hosts = config.Hosts
+    # config.HostGroups.ALL.vars.hostgroups = config.HostGroups
+    context = _Context(args, config.Settings, inventory.hosts(), config.HostGroups, inventory.hosts(args.name))
     # print([(g, g.vars) for g in inventory.groups])
-    print(yaml.safe_dump_all([f for f in context.run()], sort_keys=False))
+    # print({h: h.vars for h in inventory.hosts()})
+    results = list(context.run())
+    # print(results)
+    # print(yaml.safe_dump_all(results, sort_keys=False))
+    items: list[dict[str, Any]] = []
+    for runResults in results:
+        for play, playResults in runResults.items():
+            for scriptResult in playResults:
+                if scriptResult['status']:
+                    items.append(dict(exception=True, status=scriptResult['status']))
+                else:
+                    tasks = json.loads(scriptResult['out'])
+                    for taskNr, task in enumerate(tasks):
+                        items.append(
+                            dict(
+                                taskNr=taskNr,
+                                script=play,
+                                host=task.get('host'),
+                                ok=not task['ansible_result'].get('failed', False),
+                                failed=task['ansible_result'].get('failed', False),
+                                changed=task['ansible_result'].get('changed', False),
+                                skipped=task['ansible_result'].get('skipped', False),
+                                runtime=f"{task['runtime']:.3f}",
+                                msg=task['ansible_result'].get('msg', ''),
+                            ),
+                        )
+    columns = (
+        ('host', 'left', None),
+        ('script', 'left', None),
+        ('taskNr', 'right', 'Task'),
+        ('ok', 'left', 'OK'),
+        ('failed', 'left', None),
+        ('changed', 'left', None),
+        ('skipped', 'left', None),
+        ('runtime', 'right', None),
+        ('msg', 'left', 'Message'),
+    )
+    table = Table(title='Results')
+    for name, justify, title in columns:
+        table.add_column(title or name.title(), justify=justify)  # type: ignore[arg-type]
+    for item in items:
+        table.add_row(
+            *(str(item[name]) for name, _, _ in columns),
+            style="cyan" if item['skipped'] else 'red' if item['failed'] else 'yellow' if item['changed'] else 'green',
+        )
+    print(table)
 
 
 if __name__ == '__main__':
